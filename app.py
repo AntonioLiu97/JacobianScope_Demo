@@ -356,14 +356,17 @@ def main():
 
     model_choice = st.selectbox(
         "Model",
-        options=["LLaMA 3.2 1B", "LLaMA 3.2 3B"],
+        options=["SmolLM3-3B-Base", "LLaMA 3.2 1B", "LLaMA 3.2 3B"],
         index=0,
         key="model_choice",
         help="Choose model.",
     )
-    model_name = (
-        "meta-llama/Llama-3.2-1B" if model_choice == "LLaMA 3.2 1B" else "meta-llama/Llama-3.2-3B"
-    )
+    MODEL_MAP = {
+        "LLaMA 3.2 1B": "meta-llama/Llama-3.2-1B",
+        "LLaMA 3.2 3B": "meta-llama/Llama-3.2-3B",
+        "SmolLM3-3B-Base": "HuggingFaceTB/SmolLM3-3B-Base",
+    }
+    model_name = MODEL_MAP[model_choice]
 
     attribution_type = st.radio(
         "Attribution type",
@@ -395,7 +398,8 @@ def main():
         )
     else:
         default_text = (
-            "Italiano: Ma quando tu sarai nel dolce mondo, priegoti ch'a la mente altrui mi rechi: English: But when you have returned to the sweet world, I pray you"
+            # "Italiano: Ma quando tu sarai nel dolce mondo, priegoti ch'a la mente altrui mi rechi: English: But when you have returned to the sweet world, I pray you"
+            "French: Cet article porte sur l'attribution causale, que nous appelons lentille jacobienne. English: This is a paper on causal attribution, and we call it Jacobian"
         )
 
     text_input = st.text_area(
