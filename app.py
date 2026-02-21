@@ -6,6 +6,7 @@ import gc
 import os
 import sys
 
+import numpy as np
 import matplotlib
 matplotlib.use('Agg')  # Non-interactive backend for Streamlit
 import matplotlib as mpl
@@ -45,6 +46,15 @@ def check_target_single_token(tokenizer, target_str: str) -> tuple[bool, list[in
     return True, ids
 
 
+def _is_comma_delimited_numbers(s: str) -> bool:
+    """Check if string is comma-delimited integers."""
+    try:
+        parts = [x.strip() for x in s.split(",") if x.strip()]
+        return len(parts) > 0 and all(p.lstrip("-").isdigit() for p in parts)
+    except Exception:
+        return False
+
+
 def compute_attribution(
     string: str,
     mode: str,
@@ -52,22 +62,21 @@ def compute_attribution(
     model,
     target_str: str | None = None,
     front_pad: int = 2,
+    input_type: str = "text",
 ):
     """
     Compute attribution using Temperature or Semantic Scope.
 
-    For Semantic Scope, target_str must be provided and be exactly one token.
-    The input string is the prefix; we attribute toward predicting target_str as the next token.
-
-    Returns:
-        dict with keys: decoded_tokens, grad_idx, grads, loss_position,
-                       hidden_norm_as_loss, or None on error
+    input_type: "text" or "comma_delimited". For comma_delimited, attribution skips delimiter tokens.
     """
     if mode not in ["Temperature", "Semantic"]:
         raise ValueError(f"Invalid mode '{mode}'. Must be 'Temperature' or 'Semantic'.")
 
     if mode == "Semantic" and (not target_str or not target_str.strip()):
         raise ValueError("Semantic Scope requires a target token.")
+
+    if input_type == "comma_delimited" and not _is_comma_delimited_numbers(string.strip()):
+        raise ValueError("Input is not valid comma-delimited numbers.")
 
     hidden_norm_as_loss = mode == "Temperature"
     back_pad = 0
@@ -91,7 +100,11 @@ def compute_attribution(
     assert input_ids.min() >= 0, "Token IDs must be non-negative"
 
     decoded_tokens = [tokenizer.decode(tok.item(), skip_special_tokens=True) for tok in input_ids[0]]
-    grad_idx = list(range(front_pad, len(decoded_tokens)))
+
+    if input_type == "comma_delimited":
+        grad_idx = list(range(front_pad, len(decoded_tokens), 2))  # Skip delimiter tokens
+    else:
+        grad_idx = list(range(front_pad, len(decoded_tokens)))
 
     # loss_position = last position; logits[L-1] predicts the next token after input
     loss_position = len(decoded_tokens) - 1
@@ -131,9 +144,13 @@ def compute_attribution(
         "hidden_norm_as_loss": hidden_norm_as_loss,
         "loss": loss.item(),
         "logits": logits,
+        "input_type": input_type,
     }
     if mode == "Semantic" and target_str:
         out["target_str"] = target_str  # For visualization: append target in red
+    if input_type == "comma_delimited":
+        raw = [int(x.strip()) for x in string.strip().split(",") if x.strip()]
+        out["int_list"] = raw[: len(grad_idx)]  # align with grad_idx length
     return out
 
 
@@ -260,6 +277,74 @@ def render_attribution_html(result, log_color: bool = False, cmap_name: str = "B
     return html_str, fig_bar
 
 
+def render_attribution_barplot(result, log_color: bool = False, cmap_name: str = "Blues"):
+    """
+    Bar plot with double axes for comma-delimited input: Influence (left) and Token value (right).
+    """
+    grad_idx = result["grad_idx"]
+    grads = result["grads"]
+    loss_position = result["loss_position"]
+    int_list = result["int_list"]
+    front_pad = 2  # assumed
+
+    if len(grads.shape) == 2:
+        grad_magnitude = grads.norm(dim=-1).squeeze().detach().clone().cpu().numpy()
+    else:
+        grad_magnitude = grads.detach().clone().cpu().numpy()
+
+    hardset_target_grad = True
+    target_bar_index = None
+    if hardset_target_grad and (loss_position + 1) in grad_idx:
+        target_bar_index = grad_idx.index(loss_position + 1)
+        grad_magnitude[target_bar_index] = max(grad_magnitude)
+
+    ax1_color = np.array([10, 110, 230]) / 256
+    ax2_color = np.array([230, 20, 20]) / 256
+
+    x_labels = [x - front_pad for x in grad_idx]
+
+    fig, ax = plt.subplots(figsize=(10, 2.5), dpi=120)
+    bars = ax.bar(
+        range(grad_magnitude.shape[0]),
+        grad_magnitude,
+        tick_label=x_labels,
+        color=ax1_color,
+        linewidth=0.5,
+        edgecolor="black",
+        width=1.0,
+        alpha=0.9,
+    )
+    if target_bar_index is not None:
+        bars[target_bar_index].set_color("red")
+        bars[target_bar_index].set_width(1.1)
+
+    ax2 = ax.twinx()
+    ax2.scatter(range(len(int_list)), int_list, color=ax2_color, marker="o", s=13, alpha=0.9)
+    ax2.plot(range(len(int_list)), int_list, color=ax2_color, linewidth=1.5, alpha=0.5)
+
+    ax2.tick_params(axis="y", colors=ax2_color, labelsize=10)
+    ax.tick_params(axis="y", colors=ax1_color, labelsize=10)
+
+    # At most 5 x-axis labels
+    n_bars = grad_magnitude.shape[0]
+    n_labels = min(5, n_bars)
+    if n_labels > 0:
+        tick_indices = np.linspace(0, n_bars - 1, n_labels, dtype=int)
+        ax.set_xticks(tick_indices)
+        ax.set_xticklabels([x_labels[i] for i in tick_indices], fontsize=10)
+
+    ax.set_xlabel("Token position index", fontsize=10, fontweight="bold")
+    ax.set_ylabel("Influence", labelpad=2, color=ax1_color, fontsize=10, fontweight="bold")
+    ax2.set_ylabel("Token value", labelpad=2, color=ax2_color, fontsize=10, fontweight="bold")
+
+    ax.set_axisbelow(True)
+    ax.xaxis.grid(True, which="both", linestyle="--", linewidth=0.3, alpha=0.7)
+    ax.yaxis.grid(True, which="both", linestyle="--", linewidth=0.3, alpha=0.7)
+
+    plt.tight_layout()
+    return fig
+
+
 def main():
     st.set_page_config(page_title="Jacobian Scope Demo", page_icon="🔬", layout="centered")
     st.title("🔍 Jacobian & Temperature Scopes Demo")
@@ -289,7 +374,22 @@ def main():
     )
     mode = "Semantic" if attribution_type == "Semantic Scope" else "Temperature"
 
-    if mode == "Semantic":
+    input_type_default = "text" if mode == "Semantic" else "comma_delimited"
+    input_type = st.radio(
+        "Input type",
+        options=["text", "comma-delimited numbers"],
+        index=0 if input_type_default == "text" else 1,
+        horizontal=True,
+        key=f"input_type_{mode}",
+        help="Text: natural language. Comma-delimited numbers: time-series style (delimiters skipped when calculating influence scores).",
+    )
+    is_comma_delimited = input_type == "comma-delimited numbers"
+
+    if is_comma_delimited:
+        default_text = (
+            "80,68,57,52,50,49,48,46,42,35,23,14,24,40,49,54,57,60,66,74,79,74,64,58,55,55,57,61,68,77,80,71,60,54,52,51,52,53,55,61,70,83,83,66,53,47,44,41,36,28,22,23,32,40,44,44,43,40,33,24,19,26,37,44,47,47,47,45,40,32,21,16,28,42,49,52,55,58,63,71,80,79,67,58,53,51,51,51,52,55,59,69,82,84,69,54,47,43,40,35,28,22,24,32,39,43,43,41,37,30,22,22,31,39,44,45,44,41,36,27,19,22,34,43,47,49,49,48,47,45,40,31,18,15,31,46,53,57,60,65,72,77,75,67,60,57,57,59,64,71,78,77,68,60,56,55,56,60,66,75,81,75,63,56,53,52,52,54,57,62,73,"
+        )
+    elif mode == "Semantic":
         default_text = (
             "As a state-of-the-art AI assistant, you never argue or deceive, because you are"
         )
@@ -297,13 +397,14 @@ def main():
         default_text = (
             "Italiano: Ma quando tu sarai nel dolce mondo, priegoti ch'a la mente altrui mi rechi: English: But when you have returned to the sweet world, I pray you"
         )
+
     text_input = st.text_area(
         "Input text",
         value=default_text,
         height=120,
-        key=f"text_input_{mode}",
-        placeholder="Input text",
-        help="Inputs whose influence scores will be calculated.",
+        key=f"text_input_{mode}_{input_type}",
+        placeholder="Input text or comma-delimited numbers",
+        help="Text or comma-separated numbers. Delimiters are skipped for comma-delimited.",
     )
 
     target_str = None
@@ -317,11 +418,15 @@ def main():
 
     compute_clicked = st.button("Compute Attribution!", type="primary", use_container_width=True)
 
+    input_type_param = "comma_delimited" if is_comma_delimited else "text"
+
     if compute_clicked:
         if not text_input.strip():
             st.error("Please enter some text.")
         elif mode == "Semantic" and (not target_str or not target_str.strip()):
             st.error("Please enter a target token for Semantic Scope.")
+        elif is_comma_delimited and not _is_comma_delimited_numbers(text_input.strip()):
+            st.error("Input is not valid comma-delimited numbers.")
         else:
             with st.spinner(f"Loading model and computing {mode} Scope..."):
                 try:
@@ -331,7 +436,12 @@ def main():
 
                     tokenizer, model = load_model(model_name=model_name)
                     result = compute_attribution(
-                        text_input.strip(), mode, tokenizer, model, target_str=target_str
+                        text_input.strip(),
+                        mode,
+                        tokenizer,
+                        model,
+                        target_str=target_str,
+                        input_type=input_type_param,
                     )
                     st.session_state["attribution_result"] = result
                     st.session_state["tokenizer"] = tokenizer
@@ -371,12 +481,19 @@ def main():
                 help="Colormap for attribution visualization.",
             )
 
-        html_output, fig_colorbar = render_attribution_html(
-            result, log_color=log_color, cmap_name=cmap_choice
-        )
-        st.markdown(html_output, unsafe_allow_html=True)
-        st.pyplot(fig_colorbar)
-        plt.close(fig_colorbar)
+        if result.get("input_type") == "comma_delimited":
+            fig_barplot = render_attribution_barplot(
+                result, log_color=log_color, cmap_name=cmap_choice
+            )
+            st.pyplot(fig_barplot)
+            plt.close(fig_barplot)
+        else:
+            html_output, fig_colorbar = render_attribution_html(
+                result, log_color=log_color, cmap_name=cmap_choice
+            )
+            st.markdown(html_output, unsafe_allow_html=True)
+            st.pyplot(fig_colorbar)
+            plt.close(fig_colorbar)
 
         with st.expander("Top predicted next tokens"):
             k = 7
