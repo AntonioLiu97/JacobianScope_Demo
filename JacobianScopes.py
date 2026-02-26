@@ -114,7 +114,8 @@ def fisher_scope_scores(
         return scores, logits
 
     if method == "low_rank":
-        _, logits = forward_pass(loss_position=loss_position)
+        _, logits = forward_pass(loss_position=loss_position, hidden_norm_as_loss=True)
+        del _
         logits_t = logits[loss_position].to(residual.device)
         with torch.no_grad():
             Fx = fisher_hidden_from_logits_and_W(logits_t, W)
@@ -144,6 +145,7 @@ def fisher_scope_scores(
 
     if method == "finite_diff":
         _, logits = forward_pass(loss_position=loss_position)
+        del _
         logits_t = logits[loss_position].to(residual.device)
         with torch.no_grad():
             Fx = fisher_hidden_from_logits_and_W(logits_t, W)
@@ -199,6 +201,7 @@ def semantic_scope_scores(
     presence_ratios=None,
     grad_idx=None,
     return_grads_per_step=False,
+    target_id=None
 ):
     """
     Semantic scope: single-pass (hidden_norm_as_loss=False, unnormalized_logits) or path-integrated.
@@ -223,6 +226,7 @@ def semantic_scope_scores(
             loss_position=loss_position,
             hidden_norm_as_loss=False,
             unnormalized_logits=True,
+            target_id=target_id
         )
         grads = torch.autograd.grad(loss, residual, retain_graph=False)[0]
         scores = grads.norm(dim=-1).squeeze().cpu().numpy().astype(np.float32)

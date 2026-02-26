@@ -24,6 +24,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 _APP_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _APP_DIR)
 import JCBScope_utils
+import JacobianScopes
 
 DESIGN_DIR = os.path.join(_APP_DIR, "design")
 if not os.path.exists(DESIGN_DIR):
@@ -96,20 +97,23 @@ def compute_attribution(
     input_type: str = "text",
 ):
     """
-    Compute attribution using Temperature or Semantic Scope.
+    Compute attribution using Temperature, Semantic, or Fisher Scope.
 
     input_type: "text" or "comma_delimited". For comma_delimited, attribution skips delimiter tokens.
     """
-    if mode not in ["Temperature", "Semantic"]:
-        raise ValueError(f"Invalid mode '{mode}'. Must be 'Temperature' or 'Semantic'.")
+    if mode not in ["Temperature", "Semantic", "Fisher"]:
+        raise ValueError(f"Invalid mode '{mode}'. Must be 'Temperature', 'Semantic', or 'Fisher'.")
 
     if mode == "Semantic" and (not target_str or not target_str.strip()):
         raise ValueError("Semantic Scope requires a target token.")
+    if mode == "Semantic":
+        ok, target_id = check_target_single_token(tokenizer, target_str)
+        if not ok:
+            raise ValueError("Target must be a single token.")
 
     if input_type == "comma_delimited" and not _is_comma_delimited_numbers(string):
         raise ValueError("Input is not valid comma-delimited numbers.")
 
-    hidden_norm_as_loss = mode == "Temperature"
     back_pad = 0
 
     bos_token_id = tokenizer.bos_token_id if tokenizer.bos_token_id is not None else tokenizer.cls_token_id
@@ -126,29 +130,23 @@ def compute_attribution(
     target_device = embedding_layer.weight.device
 
     input_ids = torch.tensor([input_ids_list], dtype=torch.long).to(target_device)
-    attention_mask = torch.ones_like(input_ids)
-    assert input_ids.max() < model.config.vocab_size, "Token IDs exceed vocab size"
-    assert input_ids.min() >= 0, "Token IDs must be non-negative"
-
     decoded_tokens = [
         tokenizer.decode(tok.item(), skip_special_tokens=True, clean_up_tokenization_spaces=False)
         for tok in input_ids[0]
-    ]
+    ]    
+
+    attention_mask = torch.ones_like(input_ids)
+    # assert input_ids.max() < model.config.vocab_size, "Token IDs exceed vocab size"
+    # assert input_ids.min() >= 0, "Token IDs must be non-negative"
+
+
 
     if input_type == "comma_delimited":
         grad_idx = list(range(front_pad, len(decoded_tokens), 2))  # Skip delimiter tokens
     else:
         grad_idx = list(range(front_pad, len(decoded_tokens)))
 
-    # loss_position = last position; logits[L-1] predicts the next token after input
-    loss_position = len(decoded_tokens) - 1
-
-    target_id = None
-    if mode == "Semantic":
-        ok, ids = check_target_single_token(tokenizer, target_str)
-        if not ok:
-            raise ValueError("Target not in token dictionary.")
-        target_id = ids[0]
+    
 
     d_model = embedding_layer.embedding_dim
     residual = nn.Parameter(torch.zeros(len(grad_idx), d_model, device=target_device))
@@ -157,26 +155,33 @@ def compute_attribution(
     forward_pass = JCBScope_utils.customize_forward_pass(
         model, residual, presence, input_ids, grad_idx, attention_mask
     )
-
-    unnormalized_logits = True
-
-    loss, logits = forward_pass(
-        loss_position=loss_position,
-        hidden_norm_as_loss=hidden_norm_as_loss,
-        unnormalized_logits=unnormalized_logits,
-        tie_input_output_embed=False,
-        target_id=target_id,
-    )
-
-    grads = torch.autograd.grad(loss, residual, retain_graph=True)[0]
+    loss_position = len(decoded_tokens) - 1
+    if mode == "Temperature":
+        scores, logits = JacobianScopes.temperature_scope_scores(
+            forward_pass, residual, loss_position
+        )
+    elif mode == "Semantic":
+        scores, logits = JacobianScopes.semantic_scope_scores(
+            forward_pass, residual, loss_position, target_id = target_id
+        )
+    elif mode == "Fisher":
+        lm_head = JCBScope_utils.get_lm_head(model)
+        scores, logits = JacobianScopes.fisher_scope_scores(
+            forward_pass,
+            residual,
+            loss_position,
+            lm_head,
+            method="low_rank",
+        )
 
     out = {
         "decoded_tokens": decoded_tokens,
         "grad_idx": grad_idx,
-        "grads": grads,
+        "scores": scores,
+        "grads": None,
         "loss_position": loss_position,
-        "hidden_norm_as_loss": hidden_norm_as_loss,
-        "loss": loss.item(),
+        "hidden_norm_as_loss": mode == "Temperature",
+        "loss": None,
         "logits": logits,
         "input_type": input_type,
     }
@@ -206,7 +211,11 @@ def render_attribution_html(result, log_color: bool = False, cmap_name: str = "B
     """
     decoded_tokens = result["decoded_tokens"]
     grad_idx = result["grad_idx"]
-    grads = result["grads"]
+    if result.get("scores") is not None:
+        grad_magnitude = torch.tensor(result["scores"], dtype=torch.float32)
+    else:
+        grads = result["grads"]
+        grad_magnitude = grads.norm(dim=-1).squeeze().detach().clone()
     loss_position = result["loss_position"]
     target_str = result.get("target_str")  # Semantic: append target in red; Temperature: append <target dist>
     hardset_target_grad = True
@@ -224,10 +233,8 @@ def render_attribution_html(result, log_color: bool = False, cmap_name: str = "B
     tick_label_text = optimized_tokens.copy()
     append_suffix_in_red = True  # Semantic: target token; Temperature: "<predicted distribution>"
 
-    if len(grads.shape) == 2:
-        grad_magnitude = grads.norm(dim=-1).squeeze().detach().clone()
-    else:
-        grad_magnitude = grads.detach().clone()
+    if grad_magnitude.dim() > 1:
+        grad_magnitude = grad_magnitude.squeeze()
 
     bar_idx = None
     if not exclude_target and hardset_target_grad and (loss_position + 1) in grad_idx:
@@ -320,15 +327,17 @@ def render_attribution_barplot(result, log_color: bool = False, cmap_name: str =
     Bar plot with double axes for comma-delimited input: Influence (left) and Token value (right).
     """
     grad_idx = result["grad_idx"]
-    grads = result["grads"]
+    if result.get("scores") is not None:
+        grad_magnitude = np.array(result["scores"], dtype=np.float32).copy()
+    else:
+        grads = result["grads"]
+        if len(grads.shape) == 2:
+            grad_magnitude = grads.norm(dim=-1).squeeze().detach().clone().float().cpu().numpy()
+        else:
+            grad_magnitude = grads.detach().clone().float().cpu().numpy()
     loss_position = result["loss_position"]
     int_list = result["int_list"]
     front_pad = 2  # assumed
-
-    if len(grads.shape) == 2:
-        grad_magnitude = grads.norm(dim=-1).squeeze().detach().clone().float().cpu().numpy()
-    else:
-        grad_magnitude = grads.detach().clone().float().cpu().numpy()
 
     hardset_target_grad = True
     target_bar_index = None
@@ -378,7 +387,9 @@ def render_attribution_barplot(result, log_color: bool = False, cmap_name: str =
     ax.set_axisbelow(True)
     ax.xaxis.grid(True, which="both", linestyle="--", linewidth=0.3, alpha=0.7)
     ax.yaxis.grid(True, which="both", linestyle="--", linewidth=0.3, alpha=0.7)
-
+    if log_color:
+        ax.set_yscale("log")
+        ax.yaxis.set_major_locator(plt.MaxNLocator(integer=True, prune='lower'))
     plt.tight_layout()
     return fig
 
@@ -420,6 +431,7 @@ def main():
             st.markdown(_render_svg_html(temp_svg), unsafe_allow_html=True)
         st.markdown(
             "**Temperature Scope** — explains the confidence (effective inverse temperature) of the predictive distribution. "
+            "Particularly effective for attributing time-series predictions. "
             "Target token not required."
         )
     with scope_div2:
@@ -431,8 +443,9 @@ def main():
         if fisher_svg:
             st.markdown(_render_svg_html(fisher_svg), unsafe_allow_html=True)
         st.markdown(
-            "**Fisher Scope** — a more refined attribution tool that explains the overall predictive distribution, motivated by information geometry. "
-            "Not shown in this demo due to limited compute."
+            "**Fisher Scope** — explains the overall predictive distribution using low-rank (k=8) appxroximation of the Fisher information matrix. "
+            "Best suited for textual data. "
+            "Target token not required."
         )
 
     model_choice = st.selectbox(
@@ -451,19 +464,22 @@ def main():
 
     attribution_type = st.radio(
         "Scope type",
-        options=["Semantic Scope", "Temperature Scope"],
+        options=["Semantic Scope", "Temperature Scope", "Fisher Scope"],
         index=0,
         horizontal=True,
         key="attribution_type",
         # help="Semantic Scope: attribute toward a target token. Temperature Scope: use hidden-state norm.",
     )
-    mode = "Semantic" if attribution_type == "Semantic Scope" else "Temperature"
+    mode = "Semantic" if attribution_type == "Semantic Scope" else "Temperature" if attribution_type == "Temperature Scope" else "Fisher"
 
     if mode == "Semantic":
         input_type = "text"
         is_comma_delimited = False
     else:
-        input_type_default = "comma_delimited"
+        if mode == "Temperature":
+            input_type_default = "comma_delimited" 
+        else:
+            input_type_default ="text"
         input_type = st.radio(
             "Input type",
             options=["text", "comma-delimited numbers"],
@@ -561,7 +577,7 @@ def main():
         viz_col1, viz_col2 = st.columns([1, 1])
         with viz_col1:
             log_color = st.checkbox(
-                "Log-scale colormap",
+                "Log-scale",
                 value=False,
                 key="log_color",
                 help="Use log scale for influence values.",
