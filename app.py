@@ -1,8 +1,10 @@
 """
-Streamlit app for interactive Jacobian and Temperature Scope visualizations.
+Streamlit app for interactive Semantic and Temperature Scope visualizations.
 """
 
+import base64
 import gc
+from html import escape as html_escape
 import os
 import sys
 
@@ -19,18 +21,39 @@ from torch import nn
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 # Add current directory to path for JCBScope_utils
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+_APP_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, _APP_DIR)
 import JCBScope_utils
+
+DESIGN_DIR = os.path.join(_APP_DIR, "design")
+if not os.path.exists(DESIGN_DIR):
+    DESIGN_DIR = os.path.join(os.path.dirname(_APP_DIR), "design")
 
 # Device configuration: use CPU to match notebook and avoid device_map complexity
 device = torch.device("cpu")
 
 
+@st.cache_data
+def _load_svg(path: str) -> str | None:
+    """Load SVG file content; returns None if not found."""
+    if not os.path.exists(path):
+        return None
+    with open(path, encoding="utf-8") as f:
+        return f.read()
+
+
+def _render_svg_html(svg_content: str, max_width: int = 140) -> str:
+    """Return HTML to render SVG via base64 (reliable in Streamlit)."""
+    b64 = base64.b64encode(svg_content.encode("utf-8")).decode("utf-8")
+    return f'<img src="data:image/svg+xml;base64,{b64}" style="max-width:{max_width}px;height:auto;"/>'
+
+
 @st.cache_resource
 def load_model(model_name: str = "meta-llama/Llama-3.2-1B"):
     """Load and cache the tokenizer and model."""
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    model = AutoModelForCausalLM.from_pretrained(model_name)
+    token = os.environ.get("HF_TOKEN")
+    tokenizer = AutoTokenizer.from_pretrained(model_name, token=token)
+    model = AutoModelForCausalLM.from_pretrained(model_name, token=token)
     model = model.to(device)
     return tokenizer, model
 
@@ -47,12 +70,20 @@ def check_target_single_token(tokenizer, target_str: str) -> tuple[bool, list[in
 
 
 def _is_comma_delimited_numbers(s: str) -> bool:
-    """Check if string is comma-delimited integers."""
+    """Check if string is comma-delimited, two-digit integers."""
     try:
         parts = [x.strip() for x in s.split(",") if x.strip()]
         return len(parts) > 0 and all(p.lstrip("-").isdigit() for p in parts)
     except Exception:
         return False
+
+
+def _sort_key_for_token(s: str):
+    """Numeric tokens by value; others by lexicographic order. Total order."""
+    try:
+        return (0, float(s))
+    except ValueError:
+        return (1, s)
 
 
 def compute_attribution(
@@ -75,7 +106,7 @@ def compute_attribution(
     if mode == "Semantic" and (not target_str or not target_str.strip()):
         raise ValueError("Semantic Scope requires a target token.")
 
-    if input_type == "comma_delimited" and not _is_comma_delimited_numbers(string.strip()):
+    if input_type == "comma_delimited" and not _is_comma_delimited_numbers(string):
         raise ValueError("Input is not valid comma-delimited numbers.")
 
     hidden_norm_as_loss = mode == "Temperature"
@@ -87,7 +118,7 @@ def compute_attribution(
     input_ids_list = []
     if bos_token_id is not None:
         input_ids_list += [bos_token_id] * front_pad
-    input_ids_list += tokenizer(string.strip(), add_special_tokens=False)["input_ids"]
+    input_ids_list += tokenizer(string, add_special_tokens=False)["input_ids"]
     if eos_token_id is not None:
         input_ids_list += [eos_token_id] * back_pad
 
@@ -99,7 +130,10 @@ def compute_attribution(
     assert input_ids.max() < model.config.vocab_size, "Token IDs exceed vocab size"
     assert input_ids.min() >= 0, "Token IDs must be non-negative"
 
-    decoded_tokens = [tokenizer.decode(tok.item(), skip_special_tokens=True) for tok in input_ids[0]]
+    decoded_tokens = [
+        tokenizer.decode(tok.item(), skip_special_tokens=True, clean_up_tokenization_spaces=False)
+        for tok in input_ids[0]
+    ]
 
     if input_type == "comma_delimited":
         grad_idx = list(range(front_pad, len(decoded_tokens), 2))  # Skip delimiter tokens
@@ -149,7 +183,7 @@ def compute_attribution(
     if mode == "Semantic" and target_str:
         out["target_str"] = target_str  # For visualization: append target in red
     if input_type == "comma_delimited":
-        raw = [int(x.strip()) for x in string.strip().split(",") if x.strip()]
+        raw = [int(x.strip()) for x in string.split(",") if x.strip()]
         out["int_list"] = raw[: len(grad_idx)]  # align with grad_idx length
     return out
 
@@ -168,15 +202,17 @@ def get_text_color(bg_rgba):
 def render_attribution_html(result, log_color: bool = False, cmap_name: str = "Blues"):
     """
     Render attribution as HTML with colored token boxes (from notebook routine).
-    For Semantic Scope, appends the target token in red.
+    Semantic Scope: appends the target token in red. Temperature Scope: appends '<predicted distribution>' in red.
     """
     decoded_tokens = result["decoded_tokens"]
     grad_idx = result["grad_idx"]
     grads = result["grads"]
     loss_position = result["loss_position"]
-    target_str = result.get("target_str")  # Semantic Scope: append target in red
+    target_str = result.get("target_str")  # Semantic: append target in red; Temperature: append <target dist>
     hardset_target_grad = True
     exclude_target = False
+    # Semantic: red box with target token. Temperature: red box with "<predicted distribution>"
+    suffix_red = target_str if target_str is not None else "<predicted distribution>"
 
     cmap = plt.get_cmap(cmap_name)
 
@@ -186,7 +222,7 @@ def render_attribution_html(result, log_color: bool = False, cmap_name: str = "B
         optimized_tokens = [decoded_tokens[idx] for idx in grad_idx]
 
     tick_label_text = optimized_tokens.copy()
-    append_target_in_red = target_str is not None
+    append_suffix_in_red = True  # Semantic: target token; Temperature: "<predicted distribution>"
 
     if len(grads.shape) == 2:
         grad_magnitude = grads.norm(dim=-1).squeeze().detach().clone()
@@ -203,7 +239,7 @@ def render_attribution_html(result, log_color: bool = False, cmap_name: str = "B
             grad_magnitude[target_idx_in_grad] = 1e-8
         bar_idx = target_idx_in_grad
 
-    grad_np = grad_magnitude.cpu().numpy()
+    grad_np = grad_magnitude.float().cpu().numpy()
     log_norm = Log_Norm(vmin=grad_np.min(), vmax=grad_np.max())
     norm = Norm(vmin=grad_np.min(), vmax=grad_np.max())
 
@@ -236,7 +272,9 @@ def render_attribution_html(result, log_color: bool = False, cmap_name: str = "B
             f'white-space: pre;">{display_token}</span>'
         )
 
-    if append_target_in_red:
+    if append_suffix_in_red:
+        # Escape HTML so e.g. "<predicted distribution>" displays correctly (browsers parse < > as tags)
+        suffix_safe = html_escape(suffix_red)
         html_parts.append(
             f'<span style="'
             f"background-color: red; "
@@ -248,7 +286,7 @@ def render_attribution_html(result, log_color: bool = False, cmap_name: str = "B
             f"font-size: 16px; "
             f"display: inline-block; "
             f"font-weight: bold; "
-            f'white-space: pre;">{target_str}</span>'
+            f'white-space: pre;">{suffix_safe}</span>'
         )
 
     html_str = f'''
@@ -264,8 +302,8 @@ def render_attribution_html(result, log_color: bool = False, cmap_name: str = "B
 </div>
 '''
     # Color bar (from notebook): horizontal, matching the color mapping
-    fig_bar, ax_bar = plt.subplots(figsize=(10, 0.3), dpi=100)
-    fig_bar.subplots_adjust(left=0.3, right=0.7, bottom=0.1, top=0.9)
+    fig_bar, ax_bar = plt.subplots(figsize=(8, 0.2), dpi=100)
+    # fig_bar.subplots_adjust(left=0.3, right=0.7, bottom=0.1, top=0.9)
     cbar = mpl.colorbar.ColorbarBase(
         ax_bar,
         cmap=cmap,
@@ -288,9 +326,9 @@ def render_attribution_barplot(result, log_color: bool = False, cmap_name: str =
     front_pad = 2  # assumed
 
     if len(grads.shape) == 2:
-        grad_magnitude = grads.norm(dim=-1).squeeze().detach().clone().cpu().numpy()
+        grad_magnitude = grads.norm(dim=-1).squeeze().detach().clone().float().cpu().numpy()
     else:
-        grad_magnitude = grads.detach().clone().cpu().numpy()
+        grad_magnitude = grads.detach().clone().float().cpu().numpy()
 
     hardset_target_grad = True
     target_bar_index = None
@@ -346,17 +384,60 @@ def render_attribution_barplot(result, log_color: bool = False, cmap_name: str =
 
 
 def main():
-    st.set_page_config(page_title="Jacobian Scope Demo", page_icon="🔬", layout="centered")
-    st.title("🔍 Jacobian & Temperature Scopes Demo")
+    st.set_page_config(page_title="Jacobian Scopes Demo", page_icon="🔍", layout="centered")
+    st.title("🔍 Jacobian Scopes Demo")
     st.markdown(
-        "**Semantic Scope** explains the predicted logit for a specific target token: enter your input "
-        "passage along with a target token.\n\n"
-        "**Temperature Scope** explains the overall predictive distribution and does not require a target."
+        'Interactive demonstrations for <a href="https://arxiv.org/abs/2601.16407"><b>Jacobian Scopes: token-level causal attributions in LLMs</b></a>. <br>'
+        'Github Repo: <a href="https://github.com/AntonioLiu97/JacobianScopes">https://github.com/AntonioLiu97/JacobianScopes</a>',
+        
+        unsafe_allow_html=True,
     )
+    # Keep scope columns on one line (Streamlit stacks them below ~640px by default)
+    st.markdown(
+        '<style>div[data-testid="stHorizontalBlock"]{flex-wrap:nowrap!important}'
+        '[data-testid="column"]{min-width:120px!important}</style>',
+        unsafe_allow_html=True,
+    )
+    scope_col1, scope_div1, scope_col2, scope_div2, scope_col3 = st.columns([1, 0.02, 1, 0.02, 1])
+    semantic_svg = _load_svg(os.path.join(DESIGN_DIR, "semantic_scope_button.svg"))
+    temp_svg = _load_svg(os.path.join(DESIGN_DIR, "temperature_scope_button.svg"))
+    fisher_svg = _load_svg(os.path.join(DESIGN_DIR, "fisher_scope_button.svg"))
+    with scope_col1:
+        if semantic_svg:
+            st.markdown(_render_svg_html(semantic_svg), unsafe_allow_html=True)
+        st.markdown(
+            "**Semantic Scope** — explains the predicted logit for a specific target token. "
+            "Enter your input passage along with a target token."
+        )
+    with scope_div1:
+        st.markdown(
+            '<div style="border-left: 5px solid #888; min-height: 200px; margin: 0;"></div>',
+            # '<div style="border-left: 5px solid steelblue; min-height: 160px; margin: 0;"></div>',
+            unsafe_allow_html=True,
+        )
+    with scope_col2:
+        if temp_svg:
+            st.markdown(_render_svg_html(temp_svg), unsafe_allow_html=True)
+        st.markdown(
+            "**Temperature Scope** — explains the confidence (effective inverse temperature) of the predictive distribution. "
+            "Target token not required."
+        )
+    with scope_div2:
+        st.markdown(
+            '<div style="border-left: 5px solid #888; min-height: 200px; margin: 0;"></div>',
+            unsafe_allow_html=True,
+        )
+    with scope_col3:
+        if fisher_svg:
+            st.markdown(_render_svg_html(fisher_svg), unsafe_allow_html=True)
+        st.markdown(
+            "**Fisher Scope** — a more refined attribution tool that explains the overall predictive distribution, motivated by information geometry. "
+            "Not shown in this demo due to limited compute."
+        )
 
     model_choice = st.selectbox(
         "Model",
-        options=["SmolLM3-3B-Base", "LLaMA 3.2 1B", "LLaMA 3.2 3B"],
+        options=["LLaMA 3.2 1B", "LLaMA 3.2 3B", "SmolLM3-3B-Base"],
         index=0,
         key="model_choice",
         help="Choose model.",
@@ -369,24 +450,29 @@ def main():
     model_name = MODEL_MAP[model_choice]
 
     attribution_type = st.radio(
-        "Attribution type",
+        "Scope type",
         options=["Semantic Scope", "Temperature Scope"],
         index=0,
         horizontal=True,
-        help="Semantic Scope: attribute toward a target token. Temperature Scope: use hidden-state norm.",
+        key="attribution_type",
+        # help="Semantic Scope: attribute toward a target token. Temperature Scope: use hidden-state norm.",
     )
     mode = "Semantic" if attribution_type == "Semantic Scope" else "Temperature"
 
-    input_type_default = "text" if mode == "Semantic" else "comma_delimited"
-    input_type = st.radio(
-        "Input type",
-        options=["text", "comma-delimited numbers"],
-        index=0 if input_type_default == "text" else 1,
-        horizontal=True,
-        key=f"input_type_{mode}",
-        help="Text: natural language. Comma-delimited numbers: time-series style (delimiters skipped when calculating influence scores).",
-    )
-    is_comma_delimited = input_type == "comma-delimited numbers"
+    if mode == "Semantic":
+        input_type = "text"
+        is_comma_delimited = False
+    else:
+        input_type_default = "comma_delimited"
+        input_type = st.radio(
+            "Input type",
+            options=["text", "comma-delimited numbers"],
+            index=0 if input_type_default == "text" else 1,
+            horizontal=True,
+            key=f"input_type_{mode}",
+            help="Text: natural language. Comma-delimited numbers: time-series style. Delimiters are skipped for attribution.",
+        )
+        is_comma_delimited = input_type == "comma-delimited numbers"
 
     if is_comma_delimited:
         default_text = (
@@ -402,23 +488,27 @@ def main():
             "French: Cet article porte sur l'attribution causale, que nous appelons lentille jacobienne. English: This is a paper on causal attribution, and we call it Jacobian"
         )
 
+    text_placeholder = "Input text" if mode == "Semantic" else "Input text or comma-delimited numbers"
+    text_help = "Natural language input." if mode == "Semantic" else "Text or comma-separated numbers. Delimiters are skipped for comma-delimited."
     text_input = st.text_area(
         "Input text",
         value=default_text,
         height=120,
         key=f"text_input_{mode}_{input_type}",
-        placeholder="Input text or comma-delimited numbers",
-        help="Text or comma-separated numbers. Delimiters are skipped for comma-delimited.",
+        placeholder=text_placeholder,
+        help=text_help,
     )
+    st.caption(f"Characters: {len(text_input)}")
 
     target_str = None
     if mode == "Semantic":
         target_str = st.text_input(
-            "Target token",
+            "Target token (tip: most tokenized words start with a space character)",
             value=" truthful",
             placeholder='e.g., " truthful" or " nice"',
-            help="Must be representable as a single token (e.g. ' truthful' with leading space for Llama).",
+            help="Must be representable as a single token. Most tokenized words lead with a space character (e.g. ' truthful' for Llama).",
         )
+        st.caption(f"Characters: {len(target_str or '')}")
 
     compute_clicked = st.button("Compute Attribution!", type="primary", use_container_width=True)
 
@@ -440,7 +530,7 @@ def main():
 
                     tokenizer, model = load_model(model_name=model_name)
                     result = compute_attribution(
-                        text_input.strip(),
+                        text_input,
                         mode,
                         tokenizer,
                         model,
@@ -499,14 +589,50 @@ def main():
             st.pyplot(fig_colorbar)
             plt.close(fig_colorbar)
 
-        with st.expander("Top predicted next tokens"):
-            k = 7
-            logit_vector = result["logits"][result["loss_position"]].detach()
-            probs = torch.softmax(logit_vector, dim=-1)
-            top_probs, top_indices = torch.topk(probs, k)
-            top_tokens = [tokenizer.decode([idx]) for idx in top_indices]
-            for i, (tok, prob) in enumerate(zip(top_tokens, top_probs.cpu().numpy()), 1):
-                st.write(f"{i}. P(**{repr(tok)}**)={prob:.3f}")
+        st.subheader("Top-15 predicted next tokens")
+        k = 15
+        logit_vector = result["logits"][result["loss_position"]].detach()
+        probs = torch.softmax(logit_vector, dim=-1)
+        top_probs, top_indices = torch.topk(probs, k)
+        top_tokens = [tokenizer.decode([idx]) for idx in top_indices]
+        if result.get("input_type") == "comma_delimited":
+            # Temperature Scope comma-delimited: order by string value (numbers increasing, else lex)
+            paired = list(zip(top_tokens, top_indices.tolist(), top_probs.tolist()))
+            paired.sort(key=lambda x: _sort_key_for_token(x[0]))
+            top_tokens = [p[0] for p in paired]
+            top_probs = torch.tensor([p[2] for p in paired], dtype=top_probs.dtype)
+        prob_np = top_probs.float().cpu().numpy()
+        fig_pred, ax_pred = plt.subplots(figsize=(8, 3), dpi=100)
+        x_pos = range(k)
+        bars = ax_pred.bar(x_pos, prob_np, color="red", edgecolor="darkred", linewidth=0.5)
+        ax_pred.set_xticks(x_pos)
+        ax_pred.set_xticklabels([repr(t) for t in top_tokens], rotation=45, ha="right")
+        ax_pred.set_ylabel("Probability")
+        ax_pred.set_ylim(0, max(prob_np) * 1.1 if prob_np.max() > 0 else 1)
+        plt.tight_layout()
+        st.pyplot(fig_pred)
+        plt.close(fig_pred)
+
+    st.divider()
+    with st.expander("Citation Information", expanded=True):
+        st.markdown("**Jacobian Scopes Demo © 2026 Toni Jianbang Liu.**")
+        st.markdown("If you use this demo in your work, please cite:")
+        st.markdown(
+            "Liu, T. J., Zadeoğlu, B., Boullé, N., Sarfati, R., & Earls, C. J. (2026). "
+            "*Jacobian Scopes: token-level causal attributions in LLMs.* arXiv preprint arXiv:2601.16407."
+        )
+        st.markdown("**BibTeX:**")
+        st.code(
+            """@misc{liu2026jacobianscopestokenlevelcausal,
+      title={Jacobian Scopes: token-level causal attributions in LLMs}, 
+      author={Toni J. B. Liu and Baran Zadeoğlu and Nicolas Boullé and Raphaël Sarfati and Christopher J. Earls},
+      year={2026},
+      eprint={2601.16407},
+      archivePrefix={arXiv},
+      primaryClass={cs.CL},
+      url={https://arxiv.org/abs/2601.16407}, }""",
+            language=None,
+        )
 
 
 if __name__ == "__main__":
