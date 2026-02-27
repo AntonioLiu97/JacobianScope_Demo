@@ -538,33 +538,44 @@ def main():
         elif is_comma_delimited and not _is_comma_delimited_numbers(text_input.strip()):
             st.error("Input is not valid comma-delimited numbers.")
         else:
-            with st.spinner(f"Loading model and computing {mode} Scope..."):
-                try:
-                    torch.cuda.empty_cache()
-                    torch.cuda.ipc_collect() if torch.cuda.is_available() else None
-                    gc.collect()
+            # Progress bar for model loading and attribution
+            progress_text = st.empty()
+            progress_bar = st.progress(0)
 
-                    tokenizer, model = load_model(model_name=model_name)
-                    result = compute_attribution(
-                        text_input,
-                        mode,
-                        tokenizer,
-                        model,
-                        target_str=target_str,
-                        input_type=input_type_param,
-                    )
-                    st.session_state["attribution_result"] = result
-                    st.session_state["tokenizer"] = tokenizer
+            try:
+                progress_text.write("Step 1/3: Preparing environment...")
+                torch.cuda.empty_cache()
+                torch.cuda.ipc_collect() if torch.cuda.is_available() else None
+                gc.collect()
+                progress_bar.progress(25)
 
-                    st.success("Attribution successful!")
-                except ValueError as e:
-                    if "Target not in token dictionary" in str(e):
-                        st.error("Target not in token dictionary.")
-                    else:
-                        st.error(str(e))
-                except Exception as e:
-                    st.error(f"Error: {e}")
-                    raise
+                progress_text.write("Step 2/3: Loading model...")
+                tokenizer, model = load_model(model_name=model_name)
+                progress_bar.progress(60)
+
+                progress_text.write(f"Step 3/3: Computing {mode} Scope...")
+                result = compute_attribution(
+                    text_input,
+                    mode,
+                    tokenizer,
+                    model,
+                    target_str=target_str,
+                    input_type=input_type_param,
+                )
+                progress_bar.progress(100)
+
+                st.session_state["attribution_result"] = result
+                st.session_state["tokenizer"] = tokenizer
+
+                st.success("Attribution successful!")
+            except ValueError as e:
+                if "Target not in token dictionary" in str(e):
+                    st.error("Target not in token dictionary.")
+                else:
+                    st.error(str(e))
+            except Exception as e:
+                st.error(f"Error: {e}")
+                raise
 
     # Visualization (uses cached result; log_color and cmap are post-compute only)
     if "attribution_result" in st.session_state:
